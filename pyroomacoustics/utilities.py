@@ -181,7 +181,13 @@ def to_float32(data):
         `data` as float32.
     """
 
-    if np.issubdtype(data.dtype, np.integer):
+    if np.issubdtype(data.dtype, np.unsignedinteger):
+        # Unsigned PCM (e.g. 8-bit WAV) is centered at 2 ** (bits - 1), not 0.
+        # ``np.iinfo(dtype).min`` is 0 here, so scaling by it would divide by
+        # zero and produce nan/inf.
+        midpoint = 2 ** (8 * data.dtype.itemsize - 1)
+        return (data.astype(np.float32) - midpoint) / midpoint
+    elif np.issubdtype(data.dtype, np.integer):
         max_val = abs(np.iinfo(data.dtype).min)
         return data.astype(np.float32) / max_val
     else:
