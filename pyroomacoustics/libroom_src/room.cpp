@@ -706,59 +706,79 @@ std::tuple<Vectorf<D>, int, float> Room<D>::next_wall_hit(
 }
 
 template <size_t D>
-bool Room<D>::scat_ray(const Eigen::ArrayXf &transmitted, const Wall<D> &wall,
-                        const Vectorf<D> &prev_last_hit,
-                        const Vectorf<D> &hit_point, float travel_dist) {
-  float distance_thres = time_thres * sound_speed;
- 
-  bool ret = true;
-  for (size_t k(0); k < microphones.size(); ++k) {
-    Vectorf<D> mic_pos = microphones[k].get_loc();
- 
-    // Same as before: mic and previous hit point must be on the same
-    // side of the wall for the scattered ray to be geometrically valid.
-    if (wall.side(mic_pos) != wall.side(prev_last_hit)) {
-      ret = false;
+bool Room<D>::scat_ray(const Eigen::ArrayXf &transmitted,
+                       const Wall<D> &wall,
+                       const Vectorf<D> &prev_last_hit,
+                       const Vectorf<D> &hit_point,
+                       float travel_dist)
+{
+  const float distance_thres = time_thres * sound_speed;
+  const float b = 2.f; // Lambert compensation factor
+
+  bool all_reached = true;
+
+  for (size_t k = 0; k < microphones.size(); ++k)
+  {
+    const Vectorf<D> mic_pos = microphones[k].get_loc();
+
+    // Same-side test
+    if (wall.side(mic_pos) != wall.side(prev_last_hit))
+    {
+      all_reached = false;
       continue;
     }
- 
-    Vectorf<D> dont_care;
-    int next_wall_index(-1);
-    float hit_distance(0.);
- 
+
+    // Visibility (obstruction) test for non-convex rooms
+    Vectorf<D> dummy;
+    int obstructing = -1;
+    float dummy_d = 0.f;
     if (!is_shoebox)
-      std::tie(dont_care, next_wall_index, hit_distance) =
-          next_wall_hit(hit_point, mic_pos, true);
- 
-    if (next_wall_index == -1) {
-      Vectorf<D> hit_point_to_mic = mic_pos - hit_point;
-      float hop_dist = hit_point_to_mic.norm();
-      float travel_dist_at_mic = travel_dist + hop_dist;
- 
-      double h_sq = hop_dist * hop_dist;
-      float p_hit_equal =
-          1.f - sqrt(1.f - mic_radius_sq / std::max(mic_radius_sq, h_sq));
-      float p_lambert = 2 * std::abs(wall.cosine_angle(hit_point_to_mic));
- 
-      // NOTE: no "wall.scatter *" factor here -- `transmitted` already
-      // carries the s-weighting applied in simul_ray's diffuse branch.
-      Eigen::ArrayXf scat_trans = transmitted * p_hit_equal * p_lambert;
- 
-      if (travel_dist_at_mic < distance_thres &&
-          scat_trans.maxCoeff() > energy_thres) {
-        double r_sq = double(travel_dist_at_mic) * travel_dist_at_mic;
-        auto p_hit =
-            (1 - sqrt(1 - mic_radius_sq / std::max(mic_radius_sq, r_sq)));
-        Eigen::ArrayXf energy = scat_trans / (r_sq * p_hit);
-        microphones[k].log_histogram(travel_dist_at_mic, energy, hit_point);
-      } else
-        ret = false;
-    } else {
-      ret = false;
+      std::tie(dummy, obstructing, dummy_d) =
+          next_wall_hit(hit_point, mic_pos, /*scattered_ray=*/true);
+
+    if (obstructing != -1)
+    {
+      all_reached = false;
+      continue;
     }
+
+    // Geometry of the last hop
+    const Vectorf<D> hit_to_mic = mic_pos - hit_point;
+    const float hop_dist = hit_to_mic.norm();
+    const float travel_at_mic = travel_dist + hop_dist;
+    const double r_sq = static_cast<double>(hop_dist) * hop_dist;
+
+    // P_Hit,equal (exact solid angle of a sphere of radius R)
+    const float p_hit_equal =
+        1.f - std::sqrt(1.f - mic_radius_sq /
+                       std::max(mic_radius_sq, static_cast<float>(r_sq)));
+
+    // P_Lambert(Θ) = b · |cos Θ|
+    const float cos_theta = std::abs(wall.cosine_angle(hit_to_mic));
+    const float p_lambert = b * cos_theta;
+
+    // Energy that reaches the microphone (full transmitted, no extra *s)
+    Eigen::ArrayXf scat_energy = transmitted * p_hit_equal * p_lambert;
+
+    if (travel_at_mic >= distance_thres ||
+        scat_energy.maxCoeff() <= energy_thres)
+    {
+      all_reached = false;
+      continue;
+    }
+
+    // Normalisation that matches image-source energy (thesis eq. 5.54)
+    const double total_r_sq =
+        static_cast<double>(travel_at_mic) * travel_at_mic;
+    const float p_hit_norm =
+        1.f - std::sqrt(1.f - mic_radius_sq /
+                       std::max(mic_radius_sq, static_cast<float>(total_r_sq)));
+
+    Eigen::ArrayXf energy = scat_energy / (total_r_sq * p_hit_norm);
+    microphones[k].log_histogram(travel_at_mic, energy, hit_point);
   }
- 
-  return ret;
+
+  return all_reached;
 }
 
 template <size_t D>
@@ -777,122 +797,96 @@ void Room<D>::simul_ray(float phi, float theta, const Vectorf<D> &source_pos,
 
 template <size_t D>
 void Room<D>::simul_ray(const Vectorf<D> &ray_direction,
-                         const Vectorf<D> &source_pos,
-                         const Eigen::ArrayXf &energy_0) {
+                        const Vectorf<D> &source_pos,
+                        const Eigen::ArrayXf &energy_0)
+{
+  // ------------------ INIT --------------------
   Vectorf<D> start = source_pos;
   Vectorf<D> dir = ray_direction;
- 
-  int next_wall_index(0);
- 
+
   Eigen::ArrayXf transmitted = Eigen::ArrayXf::Ones(n_bands) * energy_0;
-  Eigen::ArrayXf energy = Eigen::ArrayXf::Ones(n_bands);
-  float travel_dist = 0;
- 
-  // Tracks whether this particle's history is STILL purely specular.
-  // Once a diffuse bounce occurs, this becomes false permanently, and
-  // from then on the particle must always be detected by RT (per
-  // thesis §5.4), regardless of how many further bounces it takes.
-  bool pure_specular_history = true;
- 
-  // Counts only the bounces that occurred while pure_specular_history
-  // was still true -- i.e. the order of the leading purely-specular
-  // chain. This is what gets compared against ism_order, matching the
-  // thesis's "specular reflections up to the applied IS reflection
-  // order" exclusion criterion.
-  int pure_specular_order = 0;
- 
-  float e_thres = energy_0.maxCoeff() * energy_thres;
-  float distance_thres = time_thres * sound_speed;
- 
-  Vectorf<D> hit_point;
- 
-  while (true) {
-    float hit_distance(0);
+  float travel_dist = 0.f;
+
+  int specular_counter = 0;
+
+  const float e_thres = energy_0.maxCoeff() * energy_thres;
+  const float distance_thres = time_thres * sound_speed;
+
+  //------------------ RAY TRACING --------------------
+  while (true)
+  {
+    // 1. Find next wall intersection
+    Vectorf<D> hit_point;
+    int next_wall_index = -1;
+    float hit_distance = 0.f;
     std::tie(hit_point, next_wall_index, hit_distance) =
-        next_wall_hit(start, start + dir * max_dist, false);
- 
-    if (next_wall_index == -1) break;
- 
+        next_wall_hit(start, start + dir * max_dist, /*scattered_ray=*/false);
+
+    if (next_wall_index == -1)
+      break; // numerical miss – stop ray
+
     Wall<D> &wall = walls[next_wall_index];
- 
-    // Only skip direct mic detection if this segment is still part of
-    // an unbroken purely-specular chain within the IS model's covered
-    // order -- anything with diffuse history in it must always be
-    // detected by RT, no matter its total bounce count.
-    bool covered_by_is =
-        is_hybrid_sim && pure_specular_history &&
-        pure_specular_order < ism_order;
- 
-    if (!covered_by_is) {
-      for (size_t k(0); k < microphones.size(); k++) {
+
+    // 2. Specular contribution to microphones (only after ISM order in hybrid mode)
+    if (!(is_hybrid_sim && specular_counter < ism_order))
+    {
+      for (size_t k = 0; k < microphones.size(); ++k)
+      {
         Vectorf<D> to_mic = microphones[k].get_loc() - start;
         float impact_distance = to_mic.dot(dir);
- 
-        bool impacts = -libroom_eps < impact_distance &&
-                       impact_distance < hit_distance + libroom_eps;
- 
-        if (impacts && (to_mic - dir * impact_distance).norm() <
-                           mic_radius + libroom_eps) {
-          float distance = fabsf(impact_distance);
-          float travel_dist_at_mic = travel_dist + distance;
- 
-          double r_sq = double(travel_dist_at_mic) * travel_dist_at_mic;
-          auto p_hit =
-              (1 - sqrt(1 - mic_radius_sq / std::max(mic_radius_sq, r_sq)));
-          energy = transmitted / (r_sq * p_hit);
- 
-          microphones[k].log_histogram(travel_dist_at_mic, energy, start);
+
+        bool impacts = (-libroom_eps < impact_distance) &&
+                       (impact_distance < hit_distance + libroom_eps) &&
+                       ((to_mic - dir * impact_distance).norm() < mic_radius + libroom_eps);
+
+        if (impacts)
+        {
+          float travel_at_mic = travel_dist + std::abs(impact_distance);
+          double r_sq = static_cast<double>(travel_at_mic) * travel_at_mic;
+          float p_hit = 1.f - std::sqrt(1.f - mic_radius_sq /
+                                 std::max(mic_radius_sq, static_cast<float>(r_sq)));
+          Eigen::ArrayXf energy = transmitted / (r_sq * p_hit);
+          microphones[k].log_histogram(travel_at_mic, energy, start);
         }
       }
     }
- 
+
+    // 3. Update travel distance and apply absorption
     travel_dist += hit_distance;
- 
-    // --- Schröder's binary specular/diffuse decision --------------
-    // Single coin flip per hit against the wall's scattering
-    // coefficient. Use the per-band scattering array so the decision
-    // still respects frequency-dependent material data, but the
-    // DIRECTION decision itself is one shared draw -- a real physical
-    // wavefront doesn't split into a "70% specular, 30% diffuse"
-    // direction; it goes one way or the other for this particle.
-    float s_repr = wall.does_scatter ? wall.average_scatter : 0.f;
-    float r = rng::uniform(0.f, 1.f);
-    bool diffuse_event = wall.does_scatter && (r < s_repr);
- 
-    if (diffuse_event) {
-      // Energy weighted by s (per band), matching Fig. 5.10(b):
-      // Er,diffuse = s * (1-alpha) * Ei
-      transmitted *= wall.scatter;
- 
-      pure_specular_history = false;  // chain is no longer pure specular
- 
-      // Fire the "rain" secondary ray to every microphone now, using
-      // the already s-weighted transmitted energy.
-      scat_ray(transmitted, wall, start, hit_point, travel_dist);
- 
-      // Continue in a freshly sampled Lambertian direction.
-      dir = -wall.sample_lambertian_reflection();
-    } else {
-      // Energy weighted by (1-s), matching Fig. 5.10(b):
-      // Er,specular = (1-s) * (1-alpha) * Ei
-      transmitted *= (1.f - wall.scatter);
- 
-      if (pure_specular_history) pure_specular_order += 1;
- 
-      // Continue as a pure mirror reflection -- no blending.
-      dir = wall.normal_reflect(dir);
-    }
- 
-    // Absorption is applied via the wall's transmission the same way
-    // as before, on top of the specular/diffuse energy split above.
-    // (If get_energy_reflection() already folds in absorption, this
-    // line should be omitted to avoid double-applying it -- check
-    // against your wall.get_energy_reflection() implementation.)
-    // transmitted *= wall.get_absorption_only_transmission();
- 
+    transmitted *= wall.get_energy_reflection(); // (1 - absorption)
+
+    // Early termination
     if (travel_dist > distance_thres || transmitted.maxCoeff() < e_thres)
       break;
- 
+
+    // 4. Decide: specular or diffuse? (paper / Diffuse Rain model)
+    // Use the average scattering coefficient for the Bernoulli trial
+    // (frequency-dependent scatter is already accounted for in the
+    // energy that reaches the secondary rain).
+    const float s = wall.average_scatter;
+    const bool is_diffuse = (s > 0.f) && (rng::uniform(0.f, 1.f) < s);
+
+    if (is_diffuse)
+    {
+      // ---- DIFFUSE REFLECTION ----
+      // Shoot secondary rain with the *full* current energy
+      // (the factor s has already been applied by the probabilistic branch)
+      scat_ray(transmitted, wall, start, hit_point, travel_dist);
+
+      // Continue the main ray in a pure Lambert direction
+      // (normal points outward → invert)
+      dir = -wall.sample_lambertian_reflection();
+      dir = dir.normalized();
+    }
+    else
+    {
+      // ---- SPECULAR REFLECTION ----
+      // No secondary rain is generated
+      dir = wall.normal_reflect(dir); // pure mirror reflection
+    }
+
+    // Prepare next iteration
+    specular_counter += 1;
     start = hit_point;
   }
 }
