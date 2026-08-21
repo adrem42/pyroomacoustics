@@ -710,40 +710,40 @@ bool Room<D>::scat_ray(const Eigen::ArrayXf &transmitted, const Wall<D> &wall,
                         const Vectorf<D> &prev_last_hit,
                         const Vectorf<D> &hit_point, float travel_dist) {
   float distance_thres = time_thres * sound_speed;
- 
+
   bool ret = true;
   for (size_t k(0); k < microphones.size(); ++k) {
     Vectorf<D> mic_pos = microphones[k].get_loc();
- 
+
     // Same as before: mic and previous hit point must be on the same
     // side of the wall for the scattered ray to be geometrically valid.
     if (wall.side(mic_pos) != wall.side(prev_last_hit)) {
       ret = false;
       continue;
     }
- 
+
     Vectorf<D> dont_care;
     int next_wall_index(-1);
     float hit_distance(0.);
- 
+
     if (!is_shoebox)
       std::tie(dont_care, next_wall_index, hit_distance) =
           next_wall_hit(hit_point, mic_pos, true);
- 
+
     if (next_wall_index == -1) {
       Vectorf<D> hit_point_to_mic = mic_pos - hit_point;
       float hop_dist = hit_point_to_mic.norm();
       float travel_dist_at_mic = travel_dist + hop_dist;
- 
+
       double h_sq = hop_dist * hop_dist;
       float p_hit_equal =
           1.f - sqrt(1.f - mic_radius_sq / std::max(mic_radius_sq, h_sq));
       float p_lambert = 2 * std::abs(wall.cosine_angle(hit_point_to_mic));
- 
+
       // NOTE: no "wall.scatter *" factor here -- `transmitted` already
       // carries the s-weighting applied in simul_ray's diffuse branch.
       Eigen::ArrayXf scat_trans = transmitted * p_hit_equal * p_lambert;
- 
+
       if (travel_dist_at_mic < distance_thres &&
           scat_trans.maxCoeff() > energy_thres) {
         double r_sq = double(travel_dist_at_mic) * travel_dist_at_mic;
@@ -757,7 +757,7 @@ bool Room<D>::scat_ray(const Eigen::ArrayXf &transmitted, const Wall<D> &wall,
       ret = false;
     }
   }
- 
+
   return ret;
 }
 
@@ -781,40 +781,40 @@ void Room<D>::simul_ray(const Vectorf<D> &ray_direction,
                          const Eigen::ArrayXf &energy_0) {
   Vectorf<D> start = source_pos;
   Vectorf<D> dir = ray_direction;
- 
+
   int next_wall_index(0);
- 
+
   Eigen::ArrayXf transmitted = Eigen::ArrayXf::Ones(n_bands) * energy_0;
   Eigen::ArrayXf energy = Eigen::ArrayXf::Ones(n_bands);
   float travel_dist = 0;
- 
+
   // Tracks whether this particle's history is STILL purely specular.
   // Once a diffuse bounce occurs, this becomes false permanently, and
   // from then on the particle must always be detected by RT (per
   // thesis §5.4), regardless of how many further bounces it takes.
   bool pure_specular_history = true;
- 
+
   // Counts only the bounces that occurred while pure_specular_history
   // was still true -- i.e. the order of the leading purely-specular
   // chain. This is what gets compared against ism_order, matching the
   // thesis's "specular reflections up to the applied IS reflection
   // order" exclusion criterion.
   int pure_specular_order = 0;
- 
+
   float e_thres = energy_0.maxCoeff() * energy_thres;
   float distance_thres = time_thres * sound_speed;
- 
+
   Vectorf<D> hit_point;
- 
+
   while (true) {
     float hit_distance(0);
     std::tie(hit_point, next_wall_index, hit_distance) =
         next_wall_hit(start, start + dir * max_dist, false);
- 
+
     if (next_wall_index == -1) break;
- 
+
     Wall<D> &wall = walls[next_wall_index];
- 
+
     // Only skip direct mic detection if this segment is still part of
     // an unbroken purely-specular chain within the IS model's covered
     // order -- anything with diffuse history in it must always be
@@ -822,78 +822,84 @@ void Room<D>::simul_ray(const Vectorf<D> &ray_direction,
     bool covered_by_is =
         is_hybrid_sim && pure_specular_history &&
         pure_specular_order < ism_order;
- 
+
     if (!covered_by_is) {
       for (size_t k(0); k < microphones.size(); k++) {
         Vectorf<D> to_mic = microphones[k].get_loc() - start;
         float impact_distance = to_mic.dot(dir);
- 
+
         bool impacts = -libroom_eps < impact_distance &&
                        impact_distance < hit_distance + libroom_eps;
- 
+
         if (impacts && (to_mic - dir * impact_distance).norm() <
                            mic_radius + libroom_eps) {
           float distance = fabsf(impact_distance);
           float travel_dist_at_mic = travel_dist + distance;
- 
+
           double r_sq = double(travel_dist_at_mic) * travel_dist_at_mic;
           auto p_hit =
               (1 - sqrt(1 - mic_radius_sq / std::max(mic_radius_sq, r_sq)));
           energy = transmitted / (r_sq * p_hit);
- 
+
           microphones[k].log_histogram(travel_dist_at_mic, energy, start);
         }
       }
     }
- 
+
     travel_dist += hit_distance;
+
+    // --- Material absorption: ALWAYS applied, every bounce --------
+    // This is the (1 - alpha) factor and is completely independent of
+    // whether the bounce turns out specular or diffuse. It must happen
+    // unconditionally, before the branch below -- omitting it (or
+    // folding it into only one branch) means rays never lose energy to
+    // the wall material at all and the tail never decays.
     transmitted *= wall.get_energy_reflection();
- 
+
     // --- Schröder's binary specular/diffuse decision --------------
     // Single coin flip per hit against the wall's scattering
-    // coefficient. Use the per-band scattering array so the decision
-    // still respects frequency-dependent material data, but the
-    // DIRECTION decision itself is one shared draw -- a real physical
-    // wavefront doesn't split into a "70% specular, 30% diffuse"
-    // direction; it goes one way or the other for this particle.
+    // coefficient: the ray goes one way or the other for this bounce,
+    // never a blend of the two.
+    //
+    // IMPORTANT -- do NOT additionally scale by s / (1-s) here.
+    // Thesis p.61 describes both (a) selecting the branch by comparing
+    // a random number to s, and (b) weighting the energy by s or (1-s).
+    // Implementing both double-counts the scattering coefficient:
+    //
+    //     E[weight] = s*s + (1-s)*(1-s) = s^2 + (1-s)^2  <  1
+    //
+    // i.e. energy vanishes at every bounce (worst at s = 0.5, where
+    // half of it disappears into nothing). Branch selection with
+    // probability s ALREADY carries the s-weighting in expectation,
+    // so the explicit weight is redundant. We keep the stochastic
+    // selection (faithful to the method, unbiased) and drop the
+    // explicit weight. The alternative -- weight but don't flip -- is
+    // lower variance but is essentially what stock pyroomacoustics
+    // already does, which defeats the purpose of this variant.
     float s_repr = wall.does_scatter ? wall.average_scatter : 0.f;
     float r = rng::uniform(0.f, 1.f);
     bool diffuse_event = wall.does_scatter && (r < s_repr);
- 
+
     if (diffuse_event) {
-      // Energy weighted by s (per band), matching Fig. 5.10(b):
-      // Er,diffuse = s * (1-alpha) * Ei
-      transmitted *= wall.scatter;
- 
       pure_specular_history = false;  // chain is no longer pure specular
- 
-      // Fire the "rain" secondary ray to every microphone now, using
-      // the already s-weighted transmitted energy.
+
+      // Fire the "rain" secondary ray to every microphone. `transmitted`
+      // is absorption-weighted but NOT s-weighted -- correct, because
+      // this branch is only reached with probability s.
       scat_ray(transmitted, wall, start, hit_point, travel_dist);
- 
+
       // Continue in a freshly sampled Lambertian direction.
       dir = -wall.sample_lambertian_reflection();
     } else {
-      // Energy weighted by (1-s), matching Fig. 5.10(b):
-      // Er,specular = (1-s) * (1-alpha) * Ei
-      transmitted *= (1.f - wall.scatter);
- 
       if (pure_specular_history) pure_specular_order += 1;
- 
+
       // Continue as a pure mirror reflection -- no blending.
       dir = wall.normal_reflect(dir);
     }
- 
-    // Absorption is applied via the wall's transmission the same way
-    // as before, on top of the specular/diffuse energy split above.
-    // (If get_energy_reflection() already folds in absorption, this
-    // line should be omitted to avoid double-applying it -- check
-    // against your wall.get_energy_reflection() implementation.)
-    // transmitted *= wall.get_absorption_only_transmission();
- 
+
     if (travel_dist > distance_thres || transmitted.maxCoeff() < e_thres)
       break;
- 
+
     start = hit_point;
   }
 }
