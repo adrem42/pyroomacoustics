@@ -707,74 +707,45 @@ std::tuple<Vectorf<D>, int, float> Room<D>::next_wall_hit(
 
 template <size_t D>
 bool Room<D>::scat_ray(const Eigen::ArrayXf &transmitted, const Wall<D> &wall,
-                       const Vectorf<D> &prev_last_hit,
-                       const Vectorf<D> &hit_point, float travel_dist) {
-  /*
-    Traces a one-hop scattered ray from the last wall hit to each microphone.
-    In case the scattering ray can indeed reach the microphone (no wall in
-    between), we log the hit in a histogram
-
-    float energy: The energy of the ray right after last_wall has absorbed
-      a part of it
-    wall: The wall object where last_hit is located
-    prev_last_hit: (array size 2 or 3) the previous last wall hit_point position
-  (needed to check that the wall normal is correctly oriented) hit_point: (array
-  size 2 or 3) defines the last wall hit position travel_dist: The total
-  distance travelled by the ray from source to hit_point
-
-  :return : true if the scattered ray reached ALL the microphones, false otw
-  */
-
-  // Convert the energy threshold to transmission threshold (make this more
-  // efficient at some point)
+                        const Vectorf<D> &prev_last_hit,
+                        const Vectorf<D> &hit_point, float travel_dist) {
   float distance_thres = time_thres * sound_speed;
-
+ 
   bool ret = true;
   for (size_t k(0); k < microphones.size(); ++k) {
     Vectorf<D> mic_pos = microphones[k].get_loc();
-
-    /*
-     * We also need to check that both the microphone and the
-     * previous hit point are on the same side of the wall
-     */
+ 
+    // Same as before: mic and previous hit point must be on the same
+    // side of the wall for the scattered ray to be geometrically valid.
     if (wall.side(mic_pos) != wall.side(prev_last_hit)) {
       ret = false;
       continue;
     }
-
-    // Prepare the output tupple of next_wall_hit()
+ 
     Vectorf<D> dont_care;
     int next_wall_index(-1);
     float hit_distance(0.);
-
+ 
     if (!is_shoebox)
       std::tie(dont_care, next_wall_index, hit_distance) =
           next_wall_hit(hit_point, mic_pos, true);
-
-    // If no wall obstructs the scattered ray
+ 
     if (next_wall_index == -1) {
-      // As the ray is shot towards the microphone center,
-      // the hop dist can be easily computed
       Vectorf<D> hit_point_to_mic = mic_pos - hit_point;
       float hop_dist = hit_point_to_mic.norm();
       float travel_dist_at_mic = travel_dist + hop_dist;
-
-      // compute the scattered energy reaching the microphone
+ 
       double h_sq = hop_dist * hop_dist;
-      float p_hit_equal = 1.f - sqrt(1.f - mic_radius_sq / std::max(mic_radius_sq, h_sq));
-      // cosine angle should be positive, but could be negative if normal is
-      // facing out of room so we take abs
+      float p_hit_equal =
+          1.f - sqrt(1.f - mic_radius_sq / std::max(mic_radius_sq, h_sq));
       float p_lambert = 2 * std::abs(wall.cosine_angle(hit_point_to_mic));
-      Eigen::ArrayXf scat_trans = wall.scatter * transmitted * p_hit_equal * p_lambert;
-
-      // We add an entry to output and we increment the right element
-      // of scat_per_slot
-      if (travel_dist_at_mic < distance_thres && scat_trans.maxCoeff() > energy_thres)
-      {
-        // The (r_sq * p_hit) normalization factor is necessary to equalize the energy
-        // of the IR computed with ray tracing to that of the image source method.
-        // Ref: D. Schroeder, "Physically based real-time auralization of interactive virtual environments",
-        // section 5.4, eq. 5.54.
+ 
+      // NOTE: no "wall.scatter *" factor here -- `transmitted` already
+      // carries the s-weighting applied in simul_ray's diffuse branch.
+      Eigen::ArrayXf scat_trans = transmitted * p_hit_equal * p_lambert;
+ 
+      if (travel_dist_at_mic < distance_thres &&
+          scat_trans.maxCoeff() > energy_thres) {
         double r_sq = double(travel_dist_at_mic) * travel_dist_at_mic;
         auto p_hit =
             (1 - sqrt(1 - mic_radius_sq / std::max(mic_radius_sq, r_sq)));
@@ -783,10 +754,10 @@ bool Room<D>::scat_ray(const Eigen::ArrayXf &transmitted, const Wall<D> &wall,
       } else
         ret = false;
     } else {
-      ret = false;  // if a wall intersects the scattered ray, we return false
+      ret = false;
     }
   }
-
+ 
   return ret;
 }
 
@@ -806,131 +777,122 @@ void Room<D>::simul_ray(float phi, float theta, const Vectorf<D> &source_pos,
 
 template <size_t D>
 void Room<D>::simul_ray(const Vectorf<D> &ray_direction,
-                        const Vectorf<D> &source_pos, const Eigen::ArrayXf &energy_0) {
-  /*This function simulates one ray and fills the output vectors of
-   every microphone with all the entries produced by this ray
-   (any specular or scattered ray reaching a microphone)
-
-   phi (azimuth) and theta (colatitude) : give the orientation of the ray (2D or
-  3D) source_pos: (array size 2 or 3) is the location of the sound source (NOT
-  AN IMAGE SOURCE) energy_0: (float) the initial energy of one ray output: is
-  the std::vector that contains the entries for all the simulated rays */
-
-  // ------------------ INIT --------------------
-  // What we need to trace the ray
-  // the origin of the ray
+                         const Vectorf<D> &source_pos,
+                         const Eigen::ArrayXf &energy_0) {
   Vectorf<D> start = source_pos;
-
-  // the direction of the ray (unit vector)
   Vectorf<D> dir = ray_direction;
-
-  // The following initializations are arbitrary and does not count since we set
-  // the boolean to false
+ 
   int next_wall_index(0);
-
-  // The ray's characteristics
+ 
   Eigen::ArrayXf transmitted = Eigen::ArrayXf::Ones(n_bands) * energy_0;
   Eigen::ArrayXf energy = Eigen::ArrayXf::Ones(n_bands);
   float travel_dist = 0;
-
-  // To count the number of times the ray bounces on the walls
-  // For hybrid generation we add a ray to output only if specular_counter
-  // is higher than the ism order.
-  int specular_counter(0);
-
-  // Convert the energy threshold to transmission threshold
+ 
+  // Tracks whether this particle's history is STILL purely specular.
+  // Once a diffuse bounce occurs, this becomes false permanently, and
+  // from then on the particle must always be detected by RT (per
+  // thesis §5.4), regardless of how many further bounces it takes.
+  bool pure_specular_history = true;
+ 
+  // Counts only the bounces that occurred while pure_specular_history
+  // was still true -- i.e. the order of the leading purely-specular
+  // chain. This is what gets compared against ism_order, matching the
+  // thesis's "specular reflections up to the applied IS reflection
+  // order" exclusion criterion.
+  int pure_specular_order = 0;
+ 
   float e_thres = energy_0.maxCoeff() * energy_thres;
   float distance_thres = time_thres * sound_speed;
-
-  //---------------------------------------------
-
-  //------------------ RAY TRACING --------------------
-
+ 
   Vectorf<D> hit_point;
-
+ 
   while (true) {
-    // Find the next hit point
     float hit_distance(0);
     std::tie(hit_point, next_wall_index, hit_distance) =
         next_wall_hit(start, start + dir * max_dist, false);
-
-    // If no wall is hit (rounding errors), stop the ray
+ 
     if (next_wall_index == -1) break;
-
-    // Intersected wall
+ 
     Wall<D> &wall = walls[next_wall_index];
-
-    // Check if the specular ray hits any of the microphone
-    if (!(is_hybrid_sim && specular_counter < ism_order)) {
+ 
+    // Only skip direct mic detection if this segment is still part of
+    // an unbroken purely-specular chain within the IS model's covered
+    // order -- anything with diffuse history in it must always be
+    // detected by RT, no matter its total bounce count.
+    bool covered_by_is =
+        is_hybrid_sim && pure_specular_history &&
+        pure_specular_order < ism_order;
+ 
+    if (!covered_by_is) {
       for (size_t k(0); k < microphones.size(); k++) {
-        // Compute the distance between the line defined by (start, hit_point)
-        // and the center of the microphone (mic_pos)
         Vectorf<D> to_mic = microphones[k].get_loc() - start;
         float impact_distance = to_mic.dot(dir);
-
+ 
         bool impacts = -libroom_eps < impact_distance &&
                        impact_distance < hit_distance + libroom_eps;
-
-        // If yes, we compute the ray's transmitted amplitude at the mic
-        // and we continue the ray
+ 
         if (impacts && (to_mic - dir * impact_distance).norm() <
                            mic_radius + libroom_eps) {
-          // The length of this last hop
           float distance = fabsf(impact_distance);
-
-          // Updating travel_time and transmitted amplitude for this ray
-          // We DON'T want to modify the variables transmitted amplitude and
-          // travel_dist
-          //   because the ray will continue its way
           float travel_dist_at_mic = travel_dist + distance;
-
-          // The (r_sq * p_hit) normalization factor is necessary to equalize the energy
-          // of the IR computed with ray tracing to that of the image source method.
-          // Ref: D. Schroeder, "Physically based real-time auralization of interactive virtual environments",
-          // section 5.4, eq. 5.54.
+ 
           double r_sq = double(travel_dist_at_mic) * travel_dist_at_mic;
           auto p_hit =
               (1 - sqrt(1 - mic_radius_sq / std::max(mic_radius_sq, r_sq)));
           energy = transmitted / (r_sq * p_hit);
-
+ 
           microphones[k].log_histogram(travel_dist_at_mic, energy, start);
         }
       }
     }
-
-    // Update the characteristics
+ 
     travel_dist += hit_distance;
-    transmitted *= wall.get_energy_reflection();
-
-    // Let's shoot the scattered ray induced by the rebound on the wall
-    if (wall.does_scatter) {
-      // Shoot the scattered ray
-      scat_ray(
-          transmitted,
-          wall,
-          start,
-          hit_point,
-          travel_dist
-          );
+ 
+    // --- Schröder's binary specular/diffuse decision --------------
+    // Single coin flip per hit against the wall's scattering
+    // coefficient. Use the per-band scattering array so the decision
+    // still respects frequency-dependent material data, but the
+    // DIRECTION decision itself is one shared draw -- a real physical
+    // wavefront doesn't split into a "70% specular, 30% diffuse"
+    // direction; it goes one way or the other for this particle.
+    float s_repr = wall.does_scatter ? wall.average_scatter : 0.f;
+    float r = rng::uniform(0.f, 1.f);
+    bool diffuse_event = wall.does_scatter && (r < s_repr);
+ 
+    if (diffuse_event) {
+      // Energy weighted by s (per band), matching Fig. 5.10(b):
+      // Er,diffuse = s * (1-alpha) * Ei
+      transmitted *= wall.scatter;
+ 
+      pure_specular_history = false;  // chain is no longer pure specular
+ 
+      // Fire the "rain" secondary ray to every microphone now, using
+      // the already s-weighted transmitted energy.
+      scat_ray(transmitted, wall, start, hit_point, travel_dist);
+ 
+      // Continue in a freshly sampled Lambertian direction.
+      dir = -wall.sample_lambertian_reflection();
+    } else {
+      // Energy weighted by (1-s), matching Fig. 5.10(b):
+      // Er,specular = (1-s) * (1-alpha) * Ei
+      transmitted *= (1.f - wall.scatter);
+ 
+      if (pure_specular_history) pure_specular_order += 1;
+ 
+      // Continue as a pure mirror reflection -- no blending.
+      dir = wall.normal_reflect(dir);
     }
-
-    // Check if we reach the thresholds for this ray
-    if (travel_dist > distance_thres || transmitted.maxCoeff() < e_thres) break;
-
-    // set up for next iteration
-    specular_counter += 1;
-
-    dir = wall.normal_reflect(dir);  // conserves length
-
-    if (wall.does_scatter)
-    {
-      // Compute the scattered direction.
-      // We inverse the direction because the wall normal is pointing outward.
-      Vectorf<D> scat_dir = -wall.sample_lambertian_reflection();
-      dir = wall.average_scatter * scat_dir + (1.f - wall.average_scatter) * dir;
-      dir = dir.normalized();
-    }
-
+ 
+    // Absorption is applied via the wall's transmission the same way
+    // as before, on top of the specular/diffuse energy split above.
+    // (If get_energy_reflection() already folds in absorption, this
+    // line should be omitted to avoid double-applying it -- check
+    // against your wall.get_energy_reflection() implementation.)
+    // transmitted *= wall.get_absorption_only_transmission();
+ 
+    if (travel_dist > distance_thres || transmitted.maxCoeff() < e_thres)
+      break;
+ 
     start = hit_point;
   }
 }
@@ -1131,4 +1093,3 @@ bool Room<D>::contains(const Vectorf<D> point) {
   // then the point is in the room  => return true
   return ((n_intersections % 2) == 1);
 }
-
