@@ -24,6 +24,61 @@
  * If not, see <https://opensource.org/licenses/MIT>.
  */
 
+/*
+ * ==========================================================================
+ *  CHANGE IN THIS VERSION: scat_ray's ENERGY gate is removed entirely
+ * ==========================================================================
+ *
+ * scat_ray used to drop a scattered contribution when
+ *
+ *     scat_trans.maxCoeff() > energy_thres        // ABSOLUTE floor
+ *
+ * failed. That was wrong in two separate ways.
+ *
+ * (1) It was ray-count dependent. The energy of one ray is
+ *     ENERGY_0 / n_rays, so `transmitted` -- and with it `scat_trans` --
+ *     shrinks as the ray count grows, while the bare `energy_thres`
+ *     member does not move. simul_ray gets this right for the
+ *     ray-termination test by scaling first:
+ *
+ *         float e_thres = energy_0.maxCoeff() * energy_thres;
+ *
+ *     but scat_ray compared against the unscaled parameter. Raising the
+ *     ray count 10x therefore discarded a larger share of scattered
+ *     contributions, while the specular path in simul_ray (which has no
+ *     energy gate at all -- it logs whenever a ray passes within
+ *     mic_radius) kept everything. The simulation got LESS diffuse the
+ *     more rays it was given, by roughly 10 dB of lost tail per decade.
+ *
+ * (2) Even scaled, the gate was redundant AND mis-scaled. Redundant
+ *     because of the ordering in simul_ray's loop: `transmitted` is
+ *     attenuated by the wall, scat_ray is called, and the very next
+ *     statement kills the ray if `transmitted` has fallen below e_thres.
+ *     So the ray's energy at every scat_ray call is already bounded
+ *     below by e_thres -- the gate bounded nothing the ray-level test
+ *     did not already bound. Mis-scaled because the two tests compare
+ *     DIFFERENT quantities: the ray dies on `transmitted`, but the gate
+ *     fired on `scat_trans = transmitted * p_hit_equal * p_lambert`,
+ *     and p_hit_equal ~ mic_radius^2 / (2 * hop^2) is on the order of
+ *     0.01 for a 0.5 m receiver a few metres out. The diffuse gate
+ *     therefore tripped ~20 dB before the ray died -- and further out
+ *     for longer hops, so it cut hardest at exactly the late, distant
+ *     contributions that make up the reverberant tail.
+ *
+ * The gate is now gone. What remains is the DISTANCE check, which is not
+ * redundant: the ray-level test looks at `travel_dist`, whereas the
+ * arrival time at the mic is `travel_dist + hop_dist`, so a ray still
+ * inside the time limit can have a hop that pushes the arrival past it.
+ * Without that check the histogram would be fed arrivals beyond
+ * time_thres and grown past its intended extent.
+ *
+ * Cost of logging instead of gating is negligible: by this point the
+ * expensive work (next_wall_hit for the obstruction test) is already
+ * done, and log_histogram is a bin index plus an add.
+ *
+ * NOTE: scat_ray's signature is UNCHANGED from stock pyroomacoustics --
+ * no e_thres parameter is needed, so room.hpp requires no edit.
+ */
 
 #include <cmath>
 #include <algorithm>
@@ -709,6 +764,11 @@ template <size_t D>
 bool Room<D>::scat_ray(const Eigen::ArrayXf &transmitted, const Wall<D> &wall,
                         const Vectorf<D> &prev_last_hit,
                         const Vectorf<D> &hit_point, float travel_dist) {
+  /*
+   * Signature is identical to stock pyroomacoustics -- the energy gate
+   * that used to live here is gone (see the note at the top of this
+   * file), so no threshold needs to be passed in.
+   */
   float distance_thres = time_thres * sound_speed;
 
   bool ret = true;
@@ -740,12 +800,18 @@ bool Room<D>::scat_ray(const Eigen::ArrayXf &transmitted, const Wall<D> &wall,
           1.f - sqrt(1.f - mic_radius_sq / std::max(mic_radius_sq, h_sq));
       float p_lambert = 2 * std::abs(wall.cosine_angle(hit_point_to_mic));
 
-      // NOTE: no "wall.scatter *" factor here -- `transmitted` already
-      // carries the s-weighting applied in simul_ray's diffuse branch.
+      // NOTE: no "wall.scatter *" factor here -- this branch is only
+      // reached when the coin flip in simul_ray landed on "diffuse",
+      // which happens with probability s, and that supplies the
+      // weighting. Applying wall.scatter on top would square it.
       Eigen::ArrayXf scat_trans = transmitted * p_hit_equal * p_lambert;
 
-      if (travel_dist_at_mic < distance_thres &&
-          scat_trans.maxCoeff() > energy_thres) {
+      // FIXED: the energy half of this test is gone. Only the distance
+      // check remains, and it is NOT redundant with the ray-level test:
+      // simul_ray breaks on `travel_dist`, but the arrival here is at
+      // `travel_dist + hop_dist`, which can exceed the time limit even
+      // when the ray itself is still inside it.
+      if (travel_dist_at_mic < distance_thres) {
         double r_sq = double(travel_dist_at_mic) * travel_dist_at_mic;
         auto p_hit =
             (1 - sqrt(1 - mic_radius_sq / std::max(mic_radius_sq, r_sq)));
@@ -801,6 +867,11 @@ void Room<D>::simul_ray(const Vectorf<D> &ray_direction,
   // order" exclusion criterion.
   int pure_specular_order = 0;
 
+  // Relative energy floor: scales with the per-ray initial energy, which
+  // is itself ENERGY_0 / n_rays, so ray termination is independent of the
+  // ray count. This is the ONLY energy threshold in the tracer now --
+  // scat_ray no longer has one of its own, so it cannot disagree with
+  // this one or drift with n_rays.
   float e_thres = energy_0.maxCoeff() * energy_thres;
   float distance_thres = time_thres * sound_speed;
 
