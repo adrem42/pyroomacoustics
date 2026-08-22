@@ -1,4 +1,4 @@
-/* 
+/*
  * Type and constant definitions
  * Copyright (C) 2019  Robin Scheibler
  *
@@ -31,6 +31,7 @@
 #include <iostream>
 #include <vector>
 #include <list>
+#include <cstdint>
 #include <Eigen/Dense>
 
 extern float libroom_eps;  // epsilon is the precision for floating point computations. It is defined in libroom.cpp
@@ -66,7 +67,11 @@ struct Hit
 
 typedef std::vector<std::list<Hit>> HitLog;
 
-size_t get_new_size(size_t val, size_t cur_size)
+// NOTE: marked inline. As a non-inline free function in a header this is an
+// ODR violation if common.hpp is included from more than one translation
+// unit; it happens to link today only because it is currently included from
+// one place.
+inline size_t get_new_size(size_t val, size_t cur_size)
 {
   size_t new_size = cur_size;
   while (val >= new_size)
@@ -74,11 +79,74 @@ size_t get_new_size(size_t val, size_t cur_size)
   return new_size;
 }
 
+/*
+ * ============================================================
+ *  PRECISION FIX  --  why the accumulator is double, not float
+ * ============================================================
+ *
+ * Ray tracing deposits energy into these bins one ray at a time, and the
+ * energy carried by a single ray is ENERGY_0 / n_rays. The number of
+ * deposits landing in a given bin therefore grows in proportion to the
+ * ray count, while each deposit shrinks in proportion to it.
+ *
+ * Sequential floating point accumulation fails once the running total
+ * grows large relative to an individual deposit: when
+ *
+ *     running_sum * epsilon  >  deposit
+ *
+ * the addition rounds to no change at all and the deposit is silently
+ * discarded. For a stream of roughly equal deposits, that happens after
+ * about 1/epsilon of them -- INDEPENDENT of how big the deposits are.
+ * Making every deposit smaller does not help, because the running sum
+ * shrinks by the same factor.
+ *
+ *     float32:  1/eps ~= 8.4e6   deposits before the bin stops growing
+ *     float64:  1/eps ~= 4.5e15  deposits
+ *
+ * Measured, summing n deposits of size 1/n (exact answer 1.0):
+ *
+ *     n = 1e6   float32 -> 1.009      (fine)
+ *     n = 1e7   float32 -> 1.065      (fine)
+ *     n = 1e8   float32 -> 0.250      77% of deposits lost
+ *     n = 1e9   float32 -> 0.031      97% of deposits lost
+ *
+ * So a run at 1e8 rays silently loses most of the energy in any heavily
+ * populated bin, while a run at 1e7 does not -- the failure appears as
+ * the simulation getting WORSE as the ray count is raised.
+ *
+ * This hits the diffuse component hardest. Room<D>::scat_ray() logs a
+ * contribution at EVERY wall hit of EVERY ray, whereas the specular path
+ * in simul_ray() only logs on the rare occasions a ray passes within
+ * mic_radius. Diffuse-dominated bins therefore reach the stagnation
+ * count first and stop accumulating, while sparse specular deposits keep
+ * landing normally -- the impulse response loses diffuse energy
+ * preferentially, and loses more of it the more rays you throw at it.
+ *
+ * The accumulator's precision is what matters here, not the deposit's:
+ * the failing operation is `running_sum + deposit == running_sum`. Each
+ * individual deposit is perfectly representable in float32. Hence
+ * `array` becomes ArrayXXd. The .cast<double>() calls on the incoming
+ * values below are only there because Eigen requires matching operand
+ * types -- they are a compilation requirement, not the mechanism, and
+ * adding them without widening `array` would change nothing.
+ *
+ * `counts` is widened to 64-bit for the same class of reason: at 1e8
+ * rays with tens of bounces each, a busy bin can approach the ~2.1e9
+ * ceiling of int32, after which the count wraps negative and bin()
+ * returns garbage.
+ */
+
 class Histogram2D
 {
   size_t rows, cols;
-  Eigen::ArrayXXf array;
-  Eigen::ArrayXXi counts;
+
+  // Accumulator in DOUBLE precision -- see the note above. This is the
+  // actual fix; everything else in this class follows from it.
+  Eigen::ArrayXXd array;
+
+  // 64-bit counts: int32 can wrap at high ray counts.
+  typedef Eigen::Array<std::int64_t, Eigen::Dynamic, Eigen::Dynamic> ArrayXXi64;
+  ArrayXXi64 counts;
 
   public:
     Histogram2D() {}  // empty constructor
@@ -137,7 +205,7 @@ class Histogram2D
       if (col >= array.cols())
         resize_cols(get_new_size(col, array.cols()));
 
-      array.coeffRef(row, col) += val;
+      array.coeffRef(row, col) += double(val);
       counts.coeffRef(row, col)++;
     }
 
@@ -146,7 +214,7 @@ class Histogram2D
       if (col >= array.cols())
         resize_cols(get_new_size(col, array.cols()));
 
-      array.col(col) += val;
+      array.col(col) += val.cast<double>();
       counts.col(col) += 1;
     }
 
@@ -155,24 +223,38 @@ class Histogram2D
       if (row >= array.rows())
         resize_rows(get_new_size(row, array.rows()));
 
-      array.row(row) += val;
+      array.row(row) += val.cast<double>();
       counts.row(row) += 1;
     }
 
     float bin(Eigen::Index row, Eigen::Index col) const
     {
       if (counts.coeff(row, col) != 0)
-        return array.coeff(row, col) / counts.coeff(row, col);
+        return float(array.coeff(row, col) / double(counts.coeff(row, col)));
       else
         return 0.f;
     }
 
+    // Kept returning ArrayXXf so existing callers and the Python binding
+    // are unaffected. The accumulation happened in double; only the
+    // final result is narrowed, which is harmless -- a single conversion
+    // of an already-correct total, not a running sum.
     Eigen::ArrayXXf get_hist() const
+    {
+      return array.cast<float>();
+    }
+
+    // Full-precision accessor, for anyone who wants the totals without
+    // the narrowing above.
+    const Eigen::ArrayXXd &get_hist_double() const
     {
       return array;
     }
 
-    Eigen::ArrayXXi get_counts() const
+    // NOTE: this now returns 64-bit counts. If a pybind11 binding
+    // declared this as ArrayXXi it will need updating; the numpy array
+    // handed to Python becomes int64 instead of int32.
+    const ArrayXXi64 &get_counts() const
     {
       return counts;
     }
